@@ -8,7 +8,7 @@ volumes. Não assume caminho nenhum.
 ## Uso
 
 ```bash
-sudo bash <(curl -fsSL https://SEU-DOMINIO/update-openclaw.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/melgarafael/openclaw-vps-updater/main/update-openclaw.sh)
 ```
 
 Versão específica ou só simular:
