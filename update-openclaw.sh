@@ -183,7 +183,18 @@ COMPOSEEOF
     die "instalação subiu mas o gateway não respondeu. Config em $CDIR."
   fi
 
-  # 5) resumo
+  # 5) wrapper 'openclaw' no host — roda a CLI dentro do container, igual às VPS
+  # que já vêm com OpenClaw. Sem ele, 'openclaw' dá "command not found".
+  step "Instalando o comando 'openclaw' no host"
+  cat > /usr/local/bin/openclaw <<'WRAP'
+#!/usr/bin/env bash
+# Wrapper OpenClaw — roda a CLI dentro do container (criado por update-openclaw.sh).
+exec docker exec -it -u node openclaw node /app/dist/index.js "$@"
+WRAP
+  chmod +x /usr/local/bin/openclaw
+  ok "comando 'openclaw' disponível no PATH"
+
+  # 6) resumo
   say ""
   say "${B}${OK}══════════════════════════════════════════════${R}"
   say "${B}${OK} OpenClaw instalado ($VER) e no ar${R}"
@@ -192,8 +203,10 @@ COMPOSEEOF
   say "  Token      : ${B}$TOKEN${R}"
   say "  compose    : $CDIR"
   say ""
-  say "Próximo passo: abra a Control UI, cole o token, e configure o modelo de IA."
-  say "Ou no terminal: ${B}docker exec -it openclaw node /app/dist/index.js configure${R}"
+  say "Próximo passo: configure o modelo de IA (escolha o provedor + cole sua API key):"
+  say "  ${B}openclaw configure${R}"
+  say "Depois, abra o chat direto no terminal com: ${B}openclaw${R}"
+  say "(ou use a Control UI no navegador, colando o token acima)"
   exit 0
 }
 
