@@ -48,32 +48,188 @@ run() { # executa um comando, ou só imprime em --dry-run
   if (( DRY_RUN )); then printf '  %s[dry-run]%s %s\n' "$DIM" "$R" "$*"; else eval "$*"; fi
 }
 
-# --------------------------------------------------------------- preflight ---
-[[ $EUID -eq 0 ]] || die "rode como root (sudo). Mexer em Docker/compose exige."
-command -v docker >/dev/null || die "docker não encontrado nesta VPS."
+# espera o /healthz de um container responder 200 (gateway leva ~30s; se estiver
+# em crash-loop o exec falha e a gente segue tentando até o timeout).
+wait_healthy_container() { # <container> <porta> <tentativas>
+  local c="$1" p="$2" tries="${3:-20}" http
+  for ((i=0; i<tries; i++)); do
+    http=$(docker exec "$c" sh -lc \
+      "node -e \"fetch('http://127.0.0.1:${p}/healthz').then(r=>{console.log(r.status);process.exit(r.ok?0:1)}).catch(()=>process.exit(1))\"" 2>/dev/null) \
+      && { printf '%s' "$http"; return 0; }
+    sleep 6
+  done
+  return 1
+}
 
+# ---------------------------------------------------- instalação do zero ---
+# VPS sem OpenClaw: instala Docker (sem tocar em node no host — a imagem já traz
+# node+app) e sobe o gateway num compose mínimo, com token gerado e config local.
+fresh_install() {
+  local PORT="${OPENCLAW_PORT:-18789}"
+  local CDIR="${OPENCLAW_DIR:-/opt/openclaw}"
+  local VER="${TARGET_VERSION:-latest}"
+
+  say "\n${B}Nenhum OpenClaw encontrado — instalação do zero.${R}"
+  say "  ${DIM}porta $PORT · diretório $CDIR · versão $VER${R}"
+
+  # 1) Docker (via script oficial — resolve o Ubuntu limpo, traz o compose plugin)
+  step "Instalando o Docker (se faltar)"
+  if command -v docker >/dev/null; then
+    ok "docker já presente"
+  elif (( DRY_RUN )); then
+    printf '  %s[dry-run]%s curl -fsSL https://get.docker.com | sh\n' "$DIM" "$R"
+  else
+    curl -fsSL https://get.docker.com | sh >/tmp/docker-install.log 2>&1 \
+      || die "falha ao instalar o docker (veja /tmp/docker-install.log)."
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    ok "docker instalado"
+  fi
+  local DCI="docker compose"
+  docker compose version >/dev/null 2>&1 || DCI="docker-compose"
+  command -v "${DCI%% *}" >/dev/null || (( DRY_RUN )) || die "docker compose indisponível após instalar o docker."
+
+  # 2) credenciais + IP público (para a Control UI)
+  step "Gerando credenciais"
+  local TOKEN PUBIP
+  TOKEN=$(openssl rand -hex 32 2>/dev/null || head -c48 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  [[ -n "$TOKEN" ]] || die "não consegui gerar o token do gateway."
+  PUBIP=$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+  [[ -n "$PUBIP" ]] || PUBIP="127.0.0.1"
+  ok "token gerado · IP público: $PUBIP"
+
+  # 3) scaffold do compose
+  step "Criando o compose em $CDIR"
+  if (( DRY_RUN )); then
+    printf '  %s[dry-run]%s criaria %s/{.env,docker-compose.yml}\n' "$DIM" "$R" "$CDIR"
+    say "\n${B}Dry-run de instalação concluído.${R}"; exit 0
+  fi
+  mkdir -p "$CDIR"
+  cat > "$CDIR/.env" <<EOF
+PORT=$PORT
+PUBLIC_IP=$PUBIP
+OPENCLAW_GATEWAY_TOKEN=$TOKEN
+EOF
+  chmod 600 "$CDIR/.env"
+  cat > "$CDIR/docker-compose.yml" <<'COMPOSEEOF'
+services:
+  openclaw:
+    image: __IMAGE__
+    container_name: openclaw
+    restart: unless-stopped
+    user: root
+    ports:
+      - "${PORT}:${PORT}"
+    environment:
+      HOME: /home/node
+      PORT: ${PORT}
+      PUBLIC_IP: ${PUBLIC_IP}
+      OPENCLAW_STATE_DIR: /home/node/.openclaw
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+    volumes:
+      - openclaw_state:/home/node/.openclaw
+      - openclaw_workspace:/home/node/clawd
+    init: true
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:${PORT}/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 180s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+    command:
+      - sh
+      - -lc
+      - |
+        set -e
+        mkdir -p /home/node/.openclaw /home/node/clawd
+        if [ ! -f /home/node/.openclaw/openclaw.json ]; then
+         cat > /home/node/.openclaw/openclaw.json <<CFG
+        {
+          "gateway": {
+            "mode": "local",
+            "auth": { "mode": "token", "token": "$OPENCLAW_GATEWAY_TOKEN" },
+            "controlUi": {
+              "allowInsecureAuth": true,
+              "dangerouslyDisableDeviceAuth": true,
+              "allowedOrigins": [
+                "http://localhost:$PORT",
+                "http://127.0.0.1:$PORT",
+                "http://$PUBLIC_IP:$PORT"
+              ]
+            }
+          }
+        }
+        CFG
+        fi
+        chown -R node:node /home/node/.openclaw /home/node/clawd
+        exec su -p node -s /bin/sh -c "cd /app && node dist/index.js doctor --fix || true; node dist/index.js gateway --bind lan --port $PORT"
+volumes:
+  openclaw_state:
+  openclaw_workspace:
+COMPOSEEOF
+  sed -i "s#__IMAGE__#${REPO}:${VER}#" "$CDIR/docker-compose.yml"
+  ok "compose e .env criados"
+
+  # 4) subir
+  step "Subindo o OpenClaw (puxa a imagem, ~2GB — pode demorar)"
+  ( cd "$CDIR" && $DCI up -d ) || die "falha no 'compose up'. Veja: cd $CDIR && $DCI logs"
+
+  step "Verificando a saúde do gateway (pode levar ~40s)"
+  local HTTP
+  if HTTP=$(wait_healthy_container openclaw "$PORT" 25); then
+    ok "gateway respondeu $HTTP no /healthz — saudável"
+  else
+    warn "gateway não ficou saudável. Últimos logs:"
+    docker logs --tail 25 openclaw 2>&1 | sed 's/^/    /' || true
+    die "instalação subiu mas o gateway não respondeu. Config em $CDIR."
+  fi
+
+  # 5) resumo
+  say ""
+  say "${B}${OK}══════════════════════════════════════════════${R}"
+  say "${B}${OK} OpenClaw instalado ($VER) e no ar${R}"
+  say "${B}${OK}══════════════════════════════════════════════${R}"
+  say "  Control UI : ${B}http://$PUBIP:$PORT/${R}"
+  say "  Token      : ${B}$TOKEN${R}"
+  say "  compose    : $CDIR"
+  say ""
+  say "Próximo passo: abra a Control UI, cole o token, e configure o modelo de IA."
+  say "Ou no terminal: ${B}docker exec -it openclaw node /app/dist/index.js configure${R}"
+  exit 0
+}
+
+# --------------------------------------------------------------- preflight ---
+[[ $EUID -eq 0 ]] || die "rode como root (use sudo). Mexer em Docker exige."
+
+say "${B}OpenClaw VPS — instalador / atualizador${R} ${DIM}— @melgarafael${R}"
+(( DRY_RUN )) && warn "modo DRY-RUN: nada será alterado."
+
+# ------------------------------------------------- modo: instalar ou atualizar ---
+# Sem docker, ou docker sem nenhum container OpenClaw → instalação do zero.
+CONTAINER=""
+if command -v docker >/dev/null; then
+  CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
+    | awk 'tolower($0) ~ /openclaw/ {print $1; exit}')
+  if [[ -z "$CONTAINER" ]] && docker ps -a --format '{{.Names}}\t{{.Image}}' | grep -qi openclaw; then
+    STOPPED=$(docker ps -a --format '{{.Names}}\t{{.Image}}' | awk 'tolower($0) ~ /openclaw/ {print $1; exit}')
+    warn "container OpenClaw parado ($STOPPED) — subindo para poder atualizar"
+    docker start "$STOPPED" >/dev/null 2>&1 || true
+    sleep 3
+    CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' | awk 'tolower($0) ~ /openclaw/ {print $1; exit}')
+  fi
+fi
+
+[[ -z "$CONTAINER" ]] && fresh_install   # instala do zero e sai
+
+# --- daqui pra baixo: modo ATUALIZAR (já existe container OpenClaw) ---
 if docker compose version >/dev/null 2>&1; then
   DC="docker compose"
 elif command -v docker-compose >/dev/null 2>&1; then
   DC="docker-compose"
 else
-  die "nem 'docker compose' (v2) nem 'docker-compose' (v1) disponíveis."
+  die "docker compose indisponível — necessário para atualizar."
 fi
 
-say "${B}OpenClaw VPS Updater${R} ${DIM}— @melgarafael${R}"
-(( DRY_RUN )) && warn "modo DRY-RUN: nada será alterado."
-
-# -------------------------------------------------------------- descoberta ---
 step "Descobrindo o setup (não altero nada)"
-
-CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
-  | awk 'tolower($0) ~ /openclaw/ {print $1; exit}')
-if [[ -z "$CONTAINER" ]]; then
-  if docker ps -a --format '{{.Names}}\t{{.Image}}' | grep -qi openclaw; then
-    die "achei um container OpenClaw parado. Suba ele ('$DC up -d') antes de atualizar."
-  fi
-  die "nenhum container OpenClaw rodando. Este script atualiza uma instalação Docker existente."
-fi
 ok "container: $CONTAINER"
 
 CUR_IMAGE=$(docker inspect "$CONTAINER" --format '{{.Config.Image}}')

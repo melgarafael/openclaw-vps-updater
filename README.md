@@ -8,8 +8,11 @@ volumes. Não assume caminho nenhum.
 ## Uso
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/melgarafael/openclaw-vps-updater/main/update-openclaw.sh)
+curl -fsSL https://raw.githubusercontent.com/melgarafael/openclaw-vps-updater/main/update-openclaw.sh | sudo bash
 ```
+
+> Use a forma com **pipe** (acima), não `sudo bash <(curl ...)` — esta última perde o
+> descritor de arquivo ao passar pelo `sudo` e falha com `/dev/fd/63: No such file`.
 
 Versão específica ou só simular:
 
